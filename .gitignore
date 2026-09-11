@@ -1,0 +1,20 @@
+node_modules/
+.next/
+out/
+data/
+*.log
+
+# Secrets — never commit keys
+.env
+.env.local
+.env*.local
+
+# Template clone (reference only, not part of the app)
+_template/
+
+# Internal planning notes
+PROJECT_PLAN.md
+
+# OS
+.DS_Store
+Thumbs.db
