@@ -57,6 +57,21 @@ export interface Round {
   winner: Side | null;
 }
 
+/**
+ * Direct on-chain settlement state for ONE market, read via getMarketOnchain and
+ * NOT the MarketCreated log scan — so it keeps resolving after a market ages out
+ * of the discovery window (which is why Positions couldn't tell a bet had won).
+ */
+export interface MarketState {
+  status: MarketStatus;
+  /** Resolved, voided, or finalized — the round is decided and no longer live. */
+  settled: boolean;
+  /** Market was voided (both sides refund at 0.5) rather than resolved to a winner. */
+  voided: boolean;
+  /** Winning side once settled to a winner; null while unresolved or voided. */
+  winner: Side | null;
+}
+
 /** Crowd meter payload — the social read on a market's price. upPct + downPct = 100. */
 export interface CrowdMeter {
   upPct: number; // 0..100, rounded for display

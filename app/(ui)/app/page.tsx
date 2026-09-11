@@ -195,9 +195,9 @@ export default function AppHome() {
   );
 
   const cashOutPos = useCallback(
-    async (rec: BetRecord): Promise<CashOutResult> => {
+      async (rec: BetRecord, fraction = 1): Promise<CashOutResult> => {
       const bound = await getBound();
-      const result = await sellPositionBrowser({ marketId: rec.marketId, pool: rec.pool, side: rec.side }, bound);
+      const result = await sellPositionBrowser({ marketId: rec.marketId, pool: rec.pool, side: rec.side, quantity: rec.filledQty * fraction }, bound);
       if (!result.ok) throw new Error(result.error || "Cash out failed.");
       patchBet(bound.address, rec.marketId, rec.side, { done: true });
       return result;
@@ -481,6 +481,8 @@ function TradeModal({
   const [status, setStatus] = useState<"idle" | "pending" | "success" | "error">("idle");
   const [message, setMessage] = useState("");
   const valid = Number(stake) > 0;
+  const multiplier = trade.side === "UP" ? trade.round.upPayout : trade.round.downPayout;
+  const potential = multiplier && valid ? Number(stake) * multiplier : 0;
 
   const submit = async () => {
     if (!valid || status === "pending") return;
@@ -489,7 +491,7 @@ function TradeModal({
     try {
       const result = await place(trade.round, trade.side, Number(stake));
       setStatus("success");
-      setMessage(result.txHash ? `Confirmed on-chain: ${result.txHash.slice(0, 10)}…` : "Your call was placed.");
+      setMessage(result.txHash ? `Confirmed on-chain: ${result.txHash.slice(0, 10)}…` : "Your bet was placed.");
     } catch (error) {
       setStatus("error");
       setMessage(error instanceof Error ? error.message : "The call could not be placed.");
@@ -510,8 +512,8 @@ function TradeModal({
         <div className="eyebrow">
           {trade.round.asset} / USD · {trade.side}
         </div>
-        <h2>{status === "success" ? "Call placed." : "How much do you want to call?"}</h2>
-        <p>{status === "success" ? message : "Enter your stake in test USDC. Your payout is locked when the order fills."}</p>
+        <h2>{status === "success" ? "Bet placed." : "How much do you want to stake?"}</h2>
+        <p>{status === "success" ? message : "Enter an amount in test USDC. Your potential payout is shown before you confirm."}</p>
         {status !== "success" && (
           <>
             <label className="stake-field">
@@ -527,8 +529,9 @@ function TradeModal({
                 <b>tUSDC</b>
               </div>
             </label>
+            <div className="potential-payout"><span>Potential payout</span><strong>{potential > 0 ? `${potential.toFixed(2)} tUSDC` : "Enter a stake"}</strong></div>
             <button className="lime-btn trade-confirm" disabled={!valid || status === "pending"} onClick={submit}>
-              {status === "pending" ? "Submitting…" : `Review ${trade.side} call`} <span>→</span>
+              {status === "pending" ? "Placing bet..." : `Place ${trade.side} bet`} <span>→</span>
             </button>
             {status === "error" && (
               <p className="wallet-error" role="alert">
@@ -592,7 +595,7 @@ function PositionsPanel({
   reconnecting: boolean;
   now: number;
   onConnect: () => void;
-  onCashOut: (rec: BetRecord) => Promise<CashOutResult>;
+  onCashOut: (rec: BetRecord, fraction?: number) => Promise<CashOutResult>;
   onRedeem: (rec: BetRecord, won: boolean) => Promise<RedeemResult>;
 }) {
   const [records, setRecords] = useState<BetRecord[]>([]);
@@ -734,11 +737,13 @@ function PositionsPanel({
     const expiry = round?.expiry ?? rec.expiry ?? null;
     const secs = expiry != null ? expiry - now / 1000 : 0;
 
-    let statusLabel = "Open";
-    if (won) statusLabel = "Won";
-    else if (lost) statusLabel = "Lost";
-    else if (settled) statusLabel = "Settled";
-    else if (expiry != null && secs <= 0) statusLabel = "Locked";
+    // A history record is terminal even when its market has aged out of the
+    // rounds endpoint. Never let the countdown fallback overwrite Won/Lost.
+    let statusLabel = rec.done ? (rec.won === true ? "Won" : "Lost") : "Open";
+    if (!rec.done && won) statusLabel = "Won";
+    else if (!rec.done && lost) statusLabel = "Lost";
+    else if (!rec.done && settled) statusLabel = "Settled";
+    else if (!rec.done && expiry != null && secs <= 0) statusLabel = "Locked";
 
     return (
       <div className="position-row" key={key(rec)}>
@@ -761,13 +766,15 @@ function PositionsPanel({
             <strong>{settled ? statusLabel : expiry != null ? (secs > 0 ? formatTime(secs) : "Locked") : "…"}</strong>
           </div>
           <div>
-            <span>{settled ? "Payout" : "Cash out now"}</span>
-            <strong>{quote && quote.canCashOut ? `${quote.estProceeds.toFixed(2)} tUSDC` : settled ? (won ? "redeem →" : "--") : "no offers"}</strong>
+            <span>Potential payout</span>
+            <strong>{rec.filledQty ? `${rec.filledQty.toFixed(2)} tUSDC` : "--"}</strong>
           </div>
         </div>
         <div className="position-actions">
-          {!settled && (
-            <button
+          {!settled && !rec.done && (
+            <div className="cashout-options" aria-label="Choose cash out amount">
+            {[0.25, 0.5, 1].map((fraction) => <button
+              key={fraction}
               className="up-action"
               disabled={isBusy || !quote?.canCashOut}
               title={
@@ -775,14 +782,15 @@ function PositionsPanel({
                   ? "Sell your position back to the order book now"
                   : "No buyers on the book yet — cash out isn't available for this position right now."
               }
-              onClick={() => act(rec, () => onCashOut(rec), "Cash out")}
+              onClick={() => act(rec, () => onCashOut(rec, fraction), fraction === 1 ? "Cash out" : `Cash out ${fraction * 100}%`)}
             >
-              {isBusy ? "Working…" : "Cash out"}
-            </button>
+              {isBusy ? "Confirming…" : fraction === 1 ? "Cash out all" : `Cash out ${fraction * 100}%`}
+            </button>)}
+            </div>
           )}
-          {won && (
+          {won && !rec.done && (
             <button className="lime-btn" disabled={isBusy} onClick={() => act(rec, () => onRedeem(rec, true), "Redeem")}>
-              {isBusy ? "Working…" : "Redeem winnings"}
+              {isBusy ? "Confirming…" : "Redeem winnings"}
             </button>
           )}
           {rec.txHash && (
@@ -797,6 +805,7 @@ function PositionsPanel({
 
   return (
     <div className="positions-wrap">
+      <div className="positions-page-head"><div><div className="eyebrow">Portfolio</div><h2>Your positions</h2></div><div className="positions-summary"><span>{open.length} open</span><span>{history.length} settled</span></div></div>
       {note && <p className="position-note">{note}</p>}
       <div className="positions-section">
         <div className="eyebrow">Open calls</div>
@@ -895,6 +904,7 @@ function LeaderboardPanel({
     </div>
   );
 }
+
 
 
 

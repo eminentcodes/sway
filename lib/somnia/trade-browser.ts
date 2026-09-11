@@ -13,7 +13,7 @@
 // wallet. The tradability gate reads through that SAME exchange, so a browser bet
 // never reaches for a global key.
 
-import { probabilityToPrice } from "@somnia-chain/markets-sdk";
+import { ORDER_TYPE, probabilityToPrice, quoteBinaryStakeOverBook } from "@somnia-chain/markets-sdk";
 import type { SomniaMarkets } from "@somnia-chain/markets-sdk";
 import { ONE, BUILDER_ADDRESS, BUILDER_FEE_BPS_TIMES_1K, BUILDER_FEE_ENABLED } from "./config";
 import { BetResult, CashOutResult, MarketStatus, RedeemResult, Side } from "../types";
@@ -26,12 +26,25 @@ const SIDE_TO_SELL = { UP: "SELL_YES", DOWN: "SELL_NO" } as const;
 
 /** Turn any thrown SDK/revert error into one short, user-safe line. */
 function friendly(e: any): string {
-  const raw = (e?.shortMessage || e?.message || String(e)).split("\n")[0];
+  const parts: string[] = [];
+  let current = e;
+  for (let depth = 0; current && depth < 5; depth += 1) {
+    for (const value of [current.shortMessage, current.message, current.details, current.reason, current.name]) {
+      if (typeof value === "string") parts.push(value);
+    }
+    current = current.cause;
+  }
+  const raw = parts.join(" | ") || String(e);
   if (/User rejected|denied|rejected the request/i.test(raw)) return "You cancelled the request in your wallet.";
-  if (/PostOnlyWouldCross/i.test(raw)) return "The market moved — try again.";
-  if (/insufficient|balance|allowance/i.test(raw)) return "Not enough testnet balance to place this bet.";
-  if (/status|trading|finalized|locked/i.test(raw)) return "This market just closed. Pick another.";
-  return "Couldn't place the bet — the market may have moved. Try again.";
+  if (/chain.*mismatch|wrong network|unsupported chain|ChainMismatch/i.test(raw)) return "Switch your wallet to Somnia Shannon and try again.";
+  if (/insufficient funds for gas|gas required exceeds|intrinsic gas/i.test(raw)) return "You need more STT in your wallet to pay the network fee.";
+  if (/allowance|approve|ERC20InsufficientAllowance/i.test(raw)) return "tUSDC approval failed. Approve the wallet request and try again.";
+  if (/ERC20InsufficientBalance|transfer amount exceeds balance|insufficient.*balance|balance.*insufficient/i.test(raw)) return "You don't have enough tUSDC for this stake.";
+  if (/QuantityBelowMinimum|RouterQuantityBelowMinimum|InvalidQuantity|LotAligned|lot.?size|minimum quantity/i.test(raw)) return "This stake is below the market's minimum size. Enter a larger amount.";
+  if (/PostOnlyWouldCross|NoLiquidity|zero fill|empty book/i.test(raw)) return "There isn't enough liquidity on this side right now. Try another market.";
+  if (/status|not trading|finalized|locked|expired|market.*closed/i.test(raw)) return "This market just closed. Pick another.";
+  if (/timeout|timed out|network error|fetch failed|WebSocket|transport|HTTP request failed/i.test(raw)) return "The network did not respond. Check your connection and try again.";
+  return "The transaction could not be completed. Check your wallet and try again.";
 }
 
 /** Tradability gate through the bound exchange (public read, no signing). */
@@ -86,20 +99,31 @@ export async function placeBet(
     return { ...base, error: "Enter an amount greater than zero." };
   }
 
-  const quantity = BigInt(Math.round(amountUsd)) * ONE;
   try {
+    // `quantity` is outcome tokens, while the user enters collateral. Size the
+    // order from the current ask so the requested collateral is actually spent.
+    const [book, params] = await Promise.all([
+      ex.client.getBinaryOrderBook(pool as `0x${string}`, { depth: 100 }),
+      ex.client.getBinaryBookParams(pool as `0x${string}`),
+    ]);
+    const stake = BigInt(Math.floor(amountUsd * Number(ONE)));
+    const quote = quoteBinaryStakeOverBook(book, SIDE_TO_BUY[side], stake, ONE, params);
+    if (!quote) {
+      return { ...base, error: `There isn't enough ${side} liquidity for this stake right now. Try a larger amount or another market.` };
+    }
     const feeBps = await ensureBuilderFee(ex, pool, address);
     const order = await ex.trader.placeOrder({
       pool: pool as `0x${string}`,
-      side: SIDE_TO_BUY[side],
-      price: probabilityToPrice(0.99),
-      quantity,
-      orderType: 2, // IOC — fill now or cancel the remainder
+      side: quote.side,
+      price: quote.yesPrice,
+      quantity: quote.quantity,
+      orderType: ORDER_TYPE.MARKET,
       ...(feeBps > 0n && BUILDER_ADDRESS ? { builder: BUILDER_ADDRESS, builderFeeBpsTimes1k: feeBps } : {}),
     });
     const fill = (order.fills || [])[0];
     const filledQty = fill ? Number(fill.quantityFilled) / 1e6 : 0;
     const fillPrice = fill ? Number(fill.fillPrice) / 1e6 : null;
+    if (!fill || filledQty <= 0) return { ...base, error: `No liquidity available for ${side === "UP" ? "UP" : "DOWN"} at the moment. Try again shortly.` };
     const feeRate = feeBps > 0n ? Number(feeBps) / 1e7 : undefined;
     const fee = feeRate != null && fillPrice != null ? Math.round(filledQty * fillPrice * feeRate * 1e6) / 1e6 : undefined;
     return { ok: true, txHash: order.hash, filledQty, fillPrice, side, marketId, feeRate, fee };
@@ -114,7 +138,7 @@ export async function placeBet(
  * trade.ts::sellPosition. No fee on exits.
  */
 export async function sellPosition(
-  args: { marketId: string; pool: string; side: Side },
+  args: { marketId: string; pool: string; side: Side; quantity?: number },
   exch: Exchange
 ): Promise<CashOutResult> {
   const { marketId, pool, side } = args;
@@ -129,7 +153,8 @@ export async function sellPosition(
 
     const params = await ex.client.getBinaryBookParams(pool as `0x${string}`);
     const lot = params.lotSize > 0n ? params.lotSize : 1n;
-    const quantity = (held / lot) * lot;
+    const requested = args.quantity == null ? held : BigInt(Math.floor(args.quantity * 1e6));
+    const quantity = (requested > held ? held : requested) / lot * lot;
     if (quantity <= 0n || quantity < params.minQuantity) {
       return { ...base, error: "Position too small to cash out." };
     }
