@@ -16,9 +16,9 @@ Sway runs on the **Somnia Shannon testnet** using test funds only.
 
 ## Product Demo
 
-[![Watch the Sway product demo](./public/sway-demo-poster.jpg)](./public/sway-demo-neural.mp4)
+[![Watch the Sway product demo](./public/sway-demo-poster.jpg)](https://youtu.be/WEc79LWTzHw)
 
-[Watch or download the full demo video](./public/sway-demo-neural.mp4)
+[Watch the full demo on YouTube](https://youtu.be/WEc79LWTzHw)
 
 ## How Sway Works
 
