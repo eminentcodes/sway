@@ -16,10 +16,9 @@ Sway runs on the **Somnia Shannon testnet** using test funds only.
 
 ## Product Demo
 
-<video controls width="100%" preload="metadata" poster="./public/favicon.svg">
-  <source src="./public/sway-demo-neural.mp4" type="video/mp4" />
-  Your browser does not support embedded video. [Watch or download the demo](./public/sway-demo-neural.mp4).
-</video>
+[![Watch the Sway product demo](./public/sway-demo-poster.jpg)](./public/sway-demo-neural.mp4)
+
+[Watch or download the full demo video](./public/sway-demo-neural.mp4)
 
 ## How Sway Works
 
