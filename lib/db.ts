@@ -16,6 +16,9 @@ import { dirname } from "path";
 import { LeaderboardEntry, ResultReport } from "./types";
 
 const DB_PATH = process.env.SWAY_DB_PATH || "data/sway.json";
+const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+const REDIS_KEY = "sway:leaderboard:v1";
 
 interface PlayerRow {
   wallet: string;
@@ -55,6 +58,33 @@ function save(db: DBShape): void {
   renameSync(tmp, DB_PATH); // atomic replace
 }
 
+async function redisCommand(command: unknown[]): Promise<any> {
+  if (!REDIS_URL || !REDIS_TOKEN) return null;
+  const response = await fetch(REDIS_URL, {
+    method: "POST",
+    headers: { authorization: `Bearer ${REDIS_TOKEN}`, "content-type": "application/json" },
+    body: JSON.stringify(command),
+    cache: "no-store",
+  });
+  if (!response.ok) throw new Error(`Leaderboard storage failed (${response.status})`);
+  const payload = await response.json();
+  if (payload.error) throw new Error(payload.error);
+  return payload.result;
+}
+
+async function loadPersistent(): Promise<DBShape> {
+  if (!REDIS_URL || !REDIS_TOKEN) return load();
+  const raw = await redisCommand(["GET", REDIS_KEY]);
+  if (!raw) return emptyDB();
+  const parsed = JSON.parse(raw);
+  return { players: parsed.players || {}, results: parsed.results || {} };
+}
+
+async function savePersistent(db: DBShape): Promise<void> {
+  if (!REDIS_URL || !REDIS_TOKEN) return save(db);
+  await redisCommand(["SET", REDIS_KEY, JSON.stringify(db)]);
+}
+
 function newPlayer(wallet: string): PlayerRow {
   return { wallet, wins: 0, losses: 0, streak: 0, bestStreak: 0, pnl: 0, updatedAt: 0 };
 }
@@ -63,10 +93,10 @@ function newPlayer(wallet: string): PlayerRow {
  * Record a settled bet and update the player's aggregates.
  * Idempotent on (wallet, marketId). Returns true if newly recorded, false if dup.
  */
-export function recordResult(r: ResultReport): boolean {
+export async function recordResult(r: ResultReport): Promise<boolean> {
   const wallet = r.wallet.toLowerCase();
   const id = `${wallet}:${r.marketId}`;
-  const db = load(); // reload-before-write to reduce lost updates across workers
+  const db = await loadPersistent();
 
   if (db.results[id]) return false; // duplicate — don't double-count
   db.results[id] = true;
@@ -80,24 +110,24 @@ export function recordResult(r: ResultReport): boolean {
   p.updatedAt = Math.floor(Date.now() / 1000);
   db.players[wallet] = p;
 
-  save(db);
+  await savePersistent(db);
   return true;
 }
 
 /** Set a display handle for a wallet. */
-export function setHandle(wallet: string, handle: string): void {
+export async function setHandle(wallet: string, handle: string): Promise<void> {
   const w = wallet.toLowerCase();
-  const db = load();
+  const db = await loadPersistent();
   const p = db.players[w] || newPlayer(w);
   p.handle = handle.slice(0, 24);
   p.updatedAt = Math.floor(Date.now() / 1000);
   db.players[w] = p;
-  save(db);
+  await savePersistent(db);
 }
 
 /** Ranked leaderboard: most wins, then best streak, then PnL. */
-export function getLeaderboard(limit = 50): LeaderboardEntry[] {
-  const db = load();
+export async function getLeaderboard(limit = 50): Promise<LeaderboardEntry[]> {
+  const db = await loadPersistent();
   return Object.values(db.players)
     .filter((p) => p.wins + p.losses > 0)
     .sort((a, b) => b.wins - a.wins || b.bestStreak - a.bestStreak || b.pnl - a.pnl)
@@ -115,6 +145,6 @@ export function getLeaderboard(limit = 50): LeaderboardEntry[] {
 }
 
 /** One player's standing (for "your rank"), or null if unseen. */
-export function getPlayer(wallet: string): LeaderboardEntry | null {
-  return getLeaderboard(10_000).find((e) => e.wallet === wallet.toLowerCase()) || null;
+export async function getPlayer(wallet: string): Promise<LeaderboardEntry | null> {
+  return (await getLeaderboard(10_000)).find((e) => e.wallet === wallet.toLowerCase()) || null;
 }

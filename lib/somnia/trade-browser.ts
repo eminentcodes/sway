@@ -117,10 +117,16 @@ export async function placeBet(
       side: quote.side,
       price: quote.yesPrice,
       quantity: quote.quantity,
-      orderType: ORDER_TYPE.MARKET,
+      // Fill-or-kill: never leave the user with a silently smaller position.
+      orderType: ORDER_TYPE.FILL_OR_KILL,
       ...(feeBps > 0n && BUILDER_ADDRESS ? { builder: BUILDER_ADDRESS, builderFeeBpsTimes1k: feeBps } : {}),
     });
-    const fill = (order.fills || [])[0];
+    const fills = order.fills || [];
+    const fill = fills[0];
+    const filledRaw = fills.reduce((sum: bigint, item: any) => sum + BigInt(item.quantityFilled), 0n);
+    if (filledRaw < quote.quantity) {
+      return { ...base, error: "The full stake could not be filled at the current price. Your wallet was not charged; try again." };
+    }
     const filledQty = fill ? Number(fill.quantityFilled) / 1e6 : 0;
     const fillPrice = fill ? Number(fill.fillPrice) / 1e6 : null;
     if (!fill || filledQty <= 0) return { ...base, error: `No liquidity available for ${side === "UP" ? "UP" : "DOWN"} at the moment. Try again shortly.` };

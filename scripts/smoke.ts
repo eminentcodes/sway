@@ -46,10 +46,10 @@ check("crowd meter null → 50/50", c2.upPct === 50 && c2.downPct === 50);
 // 4. Leaderboard db: record + rank + idempotency.
 const w = "0x1111111111111111111111111111111111111111";
 const mkt = "0xsmoke" + Date.now();
-recordResult({ wallet: w, marketId: mkt, side: "UP", stake: 10, won: true, payout: 25 });
-const dup = recordResult({ wallet: w, marketId: mkt, side: "UP", stake: 10, won: true, payout: 25 });
+  await recordResult({ wallet: w, marketId: mkt, side: "UP", stake: 10, won: true, payout: 25 });
+  const dup = await recordResult({ wallet: w, marketId: mkt, side: "UP", stake: 10, won: true, payout: 25 });
 check("duplicate result is ignored", dup === false);
-const board = getLeaderboard(10);
+  const board = await getLeaderboard(10);
 const me = board.find((e) => e.wallet === w);
 check("player appears on leaderboard", !!me);
 check("pnl computed (+15)", !!me && Math.abs(me.pnl - 15) < 0.001, me ? `pnl=${me.pnl}` : "");

@@ -1,0 +1,19 @@
+Sway is a consumer prediction app built on Somnia and DreamDEX Event Contracts.
+
+Crypto trading can be complex, while traditional prediction pools can change your return as more people enter. Sway offers a simpler way to make a short-term call, with capped risk and a payout determined when you enter.
+
+Choose a live BTC or ETH round. Each round asks one question: will the price finish up, or down? UP maps to a YES outcome token; DOWN maps to a NO outcome token. You can see the crowd's implied probability and the available payout before choosing.
+
+Enter your stake, then approve the transaction in your own wallet. Sway places a real taker order against the DreamDEX Event Contract order book. Your entry price comes from actual fills, not a simulated quote. Later participants cannot dilute the payout attached to your position.
+
+Now your position is open. Sway tracks the amount filled, potential payout, and time left in the round. As the market moves, the value of your position can move too.
+
+You can attempt to cash out before resolution. Sway reads real bids for the outcome tokens you hold, and shows the estimated amount available from buyers right now. If there are no buyers, or the round is locked, cash-out is unavailable. It never presents a theoretical value as a guaranteed offer.
+
+Once the round ends, DreamDEX resolves the market on-chain. Winning outcome tokens can be redeemed for collateral. Completed positions move into history, while results contribute to your wallet's leaderboard record.
+
+The leaderboard brings the crowd into focus: wins, losses, streaks, win rate, and profit and loss give every call a visible record.
+
+Sway runs on the Somnia Shannon testnet with test funds only. Your wallet approves every transaction; Sway never holds your private key.
+
+One clear question. A live market. A transparent result. That is Sway.

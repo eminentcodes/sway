@@ -11,7 +11,19 @@ import { Market, MarketStatus } from "../types";
 
 // Somnia caps getLogs at 1000 blocks per call, so walk backwards in windows.
 const WINDOW = 1000n;
-const LOOKBACK_WINDOWS = 8;
+// How many 1000-block windows back to scan for MarketCreated logs.
+//
+// This is the wall-clock reach of discovery, and it MUST exceed the longest
+// cadence we want to show. Longer series are created far less often (a 1h round
+// is minted ~once an hour, a 15m ~every 15m) while 5m/10m rounds roll
+// constantly — so on Somnia's sub-second blocks a shallow scan only ever caught
+// the freshly-minted short cadences and silently dropped 15m/1h markets whose
+// creation log had already scrolled past the window (they rendered as "only 5m
+// and 10m markets"). 48k blocks reaches back far enough to catch a live 1h
+// market created near the start of its window; expired ones are still filtered
+// by `expiry > now` below, and a window that rate-limits just yields nothing for
+// that scan (the client keeps unexpired cards mounted across polls regardless).
+const LOOKBACK_WINDOWS = 48;
 
 interface RawMarket {
   marketId: string;

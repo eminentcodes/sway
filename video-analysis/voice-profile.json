@@ -1,0 +1,8 @@
+{
+  "provider": "Microsoft Edge neural voices",
+  "voice": "en-US-JennyNeural",
+  "rate": "-10%",
+  "style": "calm, clear female product narration",
+  "script": "narration.txt",
+  "generator": "render_neural.py"
+}

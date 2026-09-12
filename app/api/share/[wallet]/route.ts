@@ -7,7 +7,7 @@ import { getPlayer } from "../../../../lib/db";
 export const dynamic = "force-dynamic";
 
 export async function GET(_req: NextRequest, { params }: { params: { wallet: string } }) {
-  const p = getPlayer(params.wallet);
+  const p = await getPlayer(params.wallet);
   if (!p) {
     return NextResponse.json({ error: "No results yet for this wallet" }, { status: 404 });
   }

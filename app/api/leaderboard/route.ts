@@ -8,7 +8,7 @@ export const dynamic = "force-dynamic"; // always fresh; it's a live board
 export async function GET(req: NextRequest) {
   const wallet = req.nextUrl.searchParams.get("wallet");
   const limit = Math.min(Number(req.nextUrl.searchParams.get("limit")) || 50, 200);
-  const entries = getLeaderboard(limit);
-  const me = wallet ? getPlayer(wallet) : null;
+  const entries = await getLeaderboard(limit);
+  const me = wallet ? await getPlayer(wallet) : null;
   return NextResponse.json({ entries, me });
 }

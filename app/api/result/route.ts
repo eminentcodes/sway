@@ -40,6 +40,10 @@ export async function POST(req: NextRequest) {
     payout: typeof body.payout === "number" && body.payout >= 0 ? body.payout : undefined,
   };
 
-  const recorded = recordResult(report);
-  return NextResponse.json({ ok: true, recorded });
+  try {
+    const recorded = await recordResult(report);
+    return NextResponse.json({ ok: true, recorded });
+  } catch {
+    return NextResponse.json({ ok: false, error: "Leaderboard storage is unavailable" }, { status: 503 });
+  }
 }

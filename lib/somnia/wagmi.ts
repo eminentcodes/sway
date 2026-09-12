@@ -26,8 +26,9 @@ export const wagmiConfig = createConfig({
     [somniaTestnet.id]: http(RPC_URL),
   },
   ssr: true,
-  // multiInjectedProviderDiscovery: true (default) → EIP-6963 injected wallets
-  // are discovered automatically; no explicit `connectors` array needed.
+  // Keep EIP-6963 providers separate so Rabby never falls through to the
+  // generic MetaMask injected provider when several wallets are installed.
+  multiInjectedProviderDiscovery: true,
 });
 
 // Make wagmi's hooks aware of this exact config (typed chains, etc.).

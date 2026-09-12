@@ -26,6 +26,75 @@ function formatTime(seconds: number) {
   const value = Math.max(0, Math.floor(seconds));
   return `${Math.floor(value / 60).toString().padStart(2, "0")}:${(value % 60).toString().padStart(2, "0")}`;
 }
+function formatInterval(seconds: number) {
+  if (!seconds || seconds <= 0) return "live round";
+  if (seconds >= 3600 && seconds % 3600 === 0) return `${seconds / 3600}-hour`;
+  // Event-contract windows include a small scheduling buffer around the
+  // advertised cadence (for example 330s represents the 5-minute round).
+  // Snap minute labels to the nearest 5-minute cadence instead of showing 6/16.
+  const minutes = Math.max(1, Math.round(seconds / 60));
+  if (minutes >= 5) return `${Math.max(5, Math.round(minutes / 5) * 5)}-minute`;
+  return `${minutes}-minute`;
+}
+function formatCardInterval(seconds: number) {
+  if (!seconds || seconds <= 0) return "live round";
+  if (seconds >= 3600) return `${Math.max(1, Math.round(seconds / 3600))} hr round`;
+  const mins = Math.max(1, Math.round(seconds / 60 / 5) * 5);
+  return `${mins} mins round`;
+}
+
+/** Turn a wagmi/viem/EIP-1193 wallet failure into an honest line — never a blanket "cancelled". */
+function walletErrorMessage(e: unknown): string {
+  const err = e as { name?: string; code?: number; shortMessage?: string; message?: string; cause?: { code?: number; name?: string } };
+  const code = err?.code ?? err?.cause?.code;
+  const name = err?.name ?? err?.cause?.name;
+  if (code === 4001 || name === "UserRejectedRequestError") return "You dismissed the request in your wallet. Tap again when you're ready.";
+  if (code === -32002) return "Your wallet already has a request open — approve or dismiss it there, then try again.";
+  if (/chain mismatch|wrong network|unsupported chain|ChainMismatch|4902/i.test(`${name} ${err?.message}`)) return "Add or switch to Somnia Shannon (chain 50312) in your wallet, then try again.";
+  return err?.shortMessage || err?.message || "Couldn't reach your wallet. Make sure it's unlocked and on Somnia Shannon, then try again.";
+}
+
+/** Reject after `ms` with `message` if `p` hasn't settled — so a stalled wallet/receipt never spins forever. */
+function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    p.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); }
+    );
+  });
+}
+
+/**
+ * Fold a fresh /api/rounds poll into the on-screen list WITHOUT wholesale
+ * replacement — swapping the whole array is what made live cards blink out when
+ * a single poll returned a smaller or reordered subset (an RPC hiccup, a cache
+ * refresh mid-scan, or a market rotating). The incoming poll is the source of
+ * truth for every market it names; a market it *omits* is kept only until its
+ * own expiry (plus a little grace), so a momentary drop can't unmount a still-
+ * live card, yet genuinely-ended markets still fall off. The result is sorted
+ * deterministically so each market holds a stable slot poll-to-poll (no reflow).
+ */
+function mergeRounds(prev: Round[], next: Round[], nowMs: number): Round[] {
+  const GRACE_MS = 5_000;
+  const merged = new Map<string, Round>(next.map((round) => [round.marketId, round]));
+  for (const round of prev) {
+    if (!merged.has(round.marketId) && round.expiry * 1000 + GRACE_MS > nowMs) {
+      merged.set(round.marketId, round); // a still-live market this poll skipped — hold it
+    }
+  }
+  // Mirror the server's ordering (enterable first) but make it fully deterministic
+  // so a given market keeps its slot poll-to-poll: phase, then fastest cadence,
+  // then soonest expiry, then id as the final tie-break.
+  const phaseRank: Record<Round["phase"], number> = { NEXT: 0, LIVE: 1, EXPIRED: 2 };
+  return Array.from(merged.values()).sort(
+    (a, b) =>
+      phaseRank[a.phase] - phaseRank[b.phase] ||
+      a.intervalSec - b.intervalSec ||
+      a.expiry - b.expiry ||
+      a.marketId.localeCompare(b.marketId)
+  );
+}
 
 // ── Local position ledger ────────────────────────────────────────────────────
 // Path A bets are signed by the visitor's wallet, so the outcome tokens live at
@@ -114,6 +183,7 @@ export default function AppHome() {
   const [intervalFilter, setIntervalFilter] = useState<number | "all">("all");
   const [mounted, setMounted] = useState(false);
   const lastFeed = useRef("");
+  const feedRef = useRef<Round[]>(rounds); // latest merged feed, read by the poller without a stale closure
 
   const { address, isConnected, status, chainId } = useAccount();
   const { connectAsync, connectors, isPending: connecting } = useConnect();
@@ -137,19 +207,34 @@ export default function AppHome() {
   }, [address]);
 
   // ── Wallet helpers ─────────────────────────────────────────────────────────
-  const doConnect = useCallback(async (): Promise<boolean> => {
+  const doConnect = useCallback(async (selected?: (typeof connectors)[number]): Promise<{ ok: boolean; error?: string }> => {
     // Already linked (opened /app directly with a connected wallet, or a second tap) — done.
-    if (isConnected) { setWalletOpen(false); return true; }
-    const connector = connectors.find((c) => c.type === "injected") ?? connectors[0];
-    if (!connector) return false;
+    if (isConnected) { setWalletOpen(false); return { ok: true }; }
+    // The modal may hand us its "Browser wallet" placeholder (no `.type`) when
+    // no real connector was discovered — fall through to the discovered ones.
+    const chosen = selected && (selected as { type?: string }).type ? selected : undefined;
+    const connector = chosen ?? connectors.find((c) => c.type === "injected") ?? connectors[0];
+    if (!connector) return { ok: false, error: "No wallet detected. Install MetaMask or Rabby, then reload the page." };
     try {
-      await connectAsync({ connector });
+      // Time-box the request: when two wallets are installed, a non-default one
+      // (often MetaMask, when Rabby owns window.ethereum) can never surface its
+      // popup — connectAsync then hangs forever and the button just spins. A
+      // timeout turns that dead-end into an actionable message.
+      const result = await withTimeout(connectAsync({ connector }), 60000, "TIMEOUT_CONNECT");
+      if (!result.accounts?.length) {
+        return { ok: false, error: "Your wallet connected but shared no account. Open it, pick an account for this site, then try again." };
+      }
       setWalletOpen(false);
-      return true;
+      return { ok: true };
     } catch (e) {
       // wagmi throws this when the connector is already connected — treat as success.
-      if ((e as { name?: string }).name === "ConnectorAlreadyConnectedError") { setWalletOpen(false); return true; }
-      return false;
+      if ((e as { name?: string }).name === "ConnectorAlreadyConnectedError") { setWalletOpen(false); return { ok: true }; }
+      if (e instanceof Error && e.message === "TIMEOUT_CONNECT") {
+        return { ok: false, error: `${connector.name || "Your wallet"} didn't respond. If it's installed next to another wallet, open its extension and approve the connection there, then try again.` };
+      }
+      // Surface the REAL reason (rejected, request already open, wrong network)
+      // instead of swallowing it — a silent `false` reads as "nothing happened".
+      return { ok: false, error: walletErrorMessage(e) };
     }
   }, [connectAsync, connectors, isConnected]);
 
@@ -157,8 +242,22 @@ export default function AppHome() {
   const getBound = useCallback(async () => {
     const acct = getAccount(wagmiConfig);
     if (!acct.isConnected || !acct.address) throw new Error("Connect a wallet before placing your call.");
-    if (acct.chainId !== CHAIN_ID) await switchChain(wagmiConfig, { chainId: CHAIN_ID });
-    const walletClient = await getWalletClient(wagmiConfig, { chainId: CHAIN_ID });
+    if (acct.chainId !== CHAIN_ID) {
+      // A wallet that's adding Somnia for the first time can leave this pending
+      // with no response — bound it so the bet fails loud instead of spinning.
+      try {
+        await withTimeout(switchChain(wagmiConfig, { chainId: CHAIN_ID }), 45000, "TIMEOUT_SWITCH");
+      } catch (e) {
+        if (e instanceof Error && e.message === "TIMEOUT_SWITCH") {
+          throw new Error("Your wallet didn't finish switching to Somnia Shannon. Open it, approve the network, then try again.");
+        }
+        throw new Error(walletErrorMessage(e));
+      }
+    }
+    // Pass the active account explicitly. Rabby can expose multiple injected
+    // accounts; omitting this lets viem build a client for the wrong one and
+    // causes approval/sign requests to be rejected or silently not appear.
+    const walletClient = await getWalletClient(wagmiConfig, { account: acct.address, chainId: CHAIN_ID });
     if (!walletClient) throw new Error("Couldn't reach your wallet. Reconnect and try again.");
     return bindWallet(walletClient);
   }, []);
@@ -195,11 +294,12 @@ export default function AppHome() {
   );
 
   const cashOutPos = useCallback(
-      async (rec: BetRecord, fraction = 1): Promise<CashOutResult> => {
+    async (rec: BetRecord): Promise<CashOutResult> => {
       const bound = await getBound();
-      const result = await sellPositionBrowser({ marketId: rec.marketId, pool: rec.pool, side: rec.side, quantity: rec.filledQty * fraction }, bound);
+      const result = await sellPositionBrowser({ marketId: rec.marketId, pool: rec.pool, side: rec.side }, bound);
       if (!result.ok) throw new Error(result.error || "Cash out failed.");
-      patchBet(bound.address, rec.marketId, rec.side, { done: true });
+      const remainingQty = Math.max(0, rec.filledQty - result.soldQty);
+      patchBet(bound.address, rec.marketId, rec.side, { done: remainingQty < 0.000001, filledQty: remainingQty });
       return result;
     },
     [getBound]
@@ -247,12 +347,20 @@ export default function AppHome() {
         const nextRounds: Round[] = payload.rounds || [];
         if (!active) return;
         if (response.ok || nextRounds.length) {
-          // Fresh data — including the server's stale-but-usable cache on a soft error.
-          // An empty list here is a valid "no open rounds" answer, not a failure.
-          const snapshot = JSON.stringify(nextRounds);
-          if (snapshot !== lastFeed.current) {
-            lastFeed.current = snapshot;
-            setRounds(nextRounds); try { sessionStorage.setItem("sway.live-rounds", JSON.stringify(nextRounds)); } catch { /* storage unavailable */ }
+          // Never replace a populated snapshot with a transient empty response.
+          // Keeping the same market IDs mounted prevents card flicker/unmounts;
+          // subsequent successful polls update the values in place.
+          if (nextRounds.length > 0) {
+            // Merge, don't replace: a poll returning a smaller/reordered subset
+            // must update values in place and keep still-live cards mounted,
+            // never blank them. See mergeRounds.
+            const merged = mergeRounds(feedRef.current, nextRounds, Date.now());
+            const snapshot = JSON.stringify(merged);
+            if (snapshot !== lastFeed.current) {
+              lastFeed.current = snapshot;
+              feedRef.current = merged;
+              setRounds(merged); try { sessionStorage.setItem("sway.live-rounds", snapshot); } catch { /* storage unavailable */ }
+            }
           }
           setFeedError(false);
         } else {
@@ -328,7 +436,7 @@ export default function AppHome() {
         <div className="panel-top">
           <div>
             <div className="eyebrow">
-              {round.asset} / USD · {round.intervalSec ? `${Math.round(round.intervalSec / 60)} min round` : "live round"}
+              {round.asset} / USD <span className="round-duration">· {round.intervalSec ? formatCardInterval(round.intervalSec) : "live round"}</span>
             </div>
             <h2>Will {round.asset} go up or down?</h2>
           </div>
@@ -374,7 +482,11 @@ export default function AppHome() {
     .filter((round): round is Round => Boolean(round));
   const liveRounds = [...preferred, ...rounds.filter((round) => !preferred.some((selected) => selected.marketId === round.marketId))];
   const intervals = Array.from(new Set(liveRounds.map((round) => round.intervalSec).filter((value) => value > 0))).sort((a, b) => a - b);
-  const filteredRounds = intervalFilter === "all" ? liveRounds : liveRounds.filter((round) => round.intervalSec === intervalFilter);
+  // If the chosen duration has aged out of the feed, display "all" instead of an
+  // empty grid — without discarding the choice, so it re-applies the moment that
+  // duration returns.
+  const effectiveFilter = intervalFilter !== "all" && !intervals.includes(intervalFilter) ? "all" : intervalFilter;
+  const filteredRounds = effectiveFilter === "all" ? liveRounds : liveRounds.filter((round) => round.intervalSec === effectiveFilter);
 
   const loadingState = (
     <div className="loading-overlay" aria-label="Loading markets">
@@ -441,7 +553,7 @@ export default function AppHome() {
       <section className="app-content">
         {tab === "home" && <>
           <EducationBanner slide={bannerSlide} onSlide={setBannerSlide} />
-          {feedError && liveRounds.length === 0 ? errorState : liveRounds.length > 0 ? <><div className="market-toolbar"><span>Live markets</span><div className="interval-filter" role="group" aria-label="Filter by round duration"><button className={intervalFilter === "all" ? "active" : ""} onClick={() => setIntervalFilter("all")}>All</button>{intervals.map((interval) => <button key={interval} className={intervalFilter === interval ? "active" : ""} onClick={() => setIntervalFilter(interval)}>{interval >= 3600 ? `${interval / 3600}h` : `${Math.round(interval / 60)}m`}</button>)}</div></div><div className="markets-grid">{filteredRounds.length ? filteredRounds.map(marketCard) : <div className="state-panel"><h2>No rounds in this interval</h2><p>Choose another duration to see the available live markets.</p></div>}</div></> : emptyState}
+          {feedError && liveRounds.length === 0 ? errorState : liveRounds.length > 0 ? <><div className="market-toolbar"><span>Live markets</span><div className="interval-filter" role="group" aria-label="Filter by round duration"><button className={effectiveFilter === "all" ? "active" : ""} onClick={() => setIntervalFilter("all")}>All</button>{intervals.map((interval) => <button key={interval} className={effectiveFilter === interval ? "active" : ""} onClick={() => setIntervalFilter(interval)}>{interval >= 3600 ? `${interval / 3600}h` : `${Math.round(interval / 60)}m`}</button>)}</div></div><div className="markets-grid">{filteredRounds.length ? filteredRounds.map(marketCard) : <div className="state-panel"><h2>No rounds in this interval</h2><p>Choose another duration to see the available live markets.</p></div>}</div></> : emptyState}
         </>}
 
         {tab === "positions" && (
@@ -459,7 +571,7 @@ export default function AppHome() {
       </section>
 
       {trade && <TradeModal trade={trade} place={placeCall} onClose={() => setTrade(null)} />}
-      {walletOpen && <AppWalletModal connecting={connecting} onClose={() => setWalletOpen(false)} onConnect={doConnect} />}
+      {walletOpen && <AppWalletModal connectors={connectors} connecting={connecting} onClose={() => setWalletOpen(false)} onConnect={doConnect} />}
       {accountOpen && address && <AccountModal address={address} onClose={() => setAccountOpen(false)} onDisconnect={() => { disconnect(); setAccountOpen(false); router.push("/"); }} />}
     </main>
   );
@@ -480,6 +592,7 @@ function TradeModal({
   const [stake, setStake] = useState("");
   const [status, setStatus] = useState<"idle" | "pending" | "success" | "error">("idle");
   const [message, setMessage] = useState("");
+  const [txHash, setTxHash] = useState<string | undefined>();
   const valid = Number(stake) > 0;
   const multiplier = trade.side === "UP" ? trade.round.upPayout : trade.round.downPayout;
   const potential = multiplier && valid ? Number(stake) * multiplier : 0;
@@ -489,12 +602,21 @@ function TradeModal({
     setStatus("pending");
     setMessage("");
     try {
-      const result = await place(trade.round, trade.side, Number(stake));
+      // Somnia confirms in ~1s once signed; the only long leg is the human
+      // approving (possibly a tUSDC approval AND the order). Cap it so a stalled
+      // wallet or receipt-wait surfaces instead of spinning "Placing bet…" forever.
+      const result = await withTimeout(place(trade.round, trade.side, Number(stake)), 120000, "TIMEOUT_PLACE");
       setStatus("success");
+      setTxHash(result.txHash);
       setMessage(result.txHash ? `Confirmed on-chain: ${result.txHash.slice(0, 10)}…` : "Your bet was placed.");
     } catch (error) {
       setStatus("error");
-      setMessage(error instanceof Error ? error.message : "The call could not be placed.");
+      const msg = error instanceof Error ? error.message : "";
+      setMessage(
+        msg === "TIMEOUT_PLACE"
+          ? "This is taking longer than expected. If you approved the request in your wallet, the position may still land — check the Positions tab or the explorer before retrying."
+          : msg || "The call could not be placed."
+      );
     }
   };
 
@@ -541,9 +663,10 @@ function TradeModal({
           </>
         )}
         {status === "success" && (
-          <button className="lime-btn trade-confirm" onClick={onClose}>
-            Done
-          </button>
+          <div className="trade-success-actions">
+            {txHash && <a className="text-link" href={`https://shannon-explorer.somnia.network/tx/${txHash}`} target="_blank" rel="noreferrer">View transaction ↗</a>}
+            <button className="lime-btn trade-confirm" onClick={onClose}>Done</button>
+          </div>
         )}
       </section>
     </div>
@@ -551,14 +674,15 @@ function TradeModal({
 }
 
 // ── Wallet connect modal ───────────────────────────────────────────────────────
-function AppWalletModal({ connecting, onClose, onConnect }: { connecting: boolean; onClose: () => void; onConnect: () => Promise<boolean> }) {
+function AppWalletModal({ connectors, connecting, onClose, onConnect }: { connectors: readonly any[]; connecting: boolean; onClose: () => void; onConnect: (connector: any) => Promise<{ ok: boolean; error?: string }> }) {
   const [error, setError] = useState("");
-  const connect = async () => {
+  const connect = async (connector: any) => {
     setError("");
     try {
-      if (!(await onConnect())) setError("No compatible wallet was found.");
-    } catch {
-      setError("Connection was cancelled. Try again when ready.");
+      const res = await onConnect(connector);
+      if (!res.ok) setError(res.error || "Couldn't connect. Try again when you're ready.");
+    } catch (e) {
+      setError(walletErrorMessage(e));
     }
   };
   return (
@@ -567,7 +691,7 @@ function AppWalletModal({ connecting, onClose, onConnect }: { connecting: boolea
         <button className="wallet-close" onClick={onClose} aria-label="Close wallet dialog" disabled={connecting}><X size={18} /></button>
         <div className="wallet-heading"><span className="wallet-heading-icon"><Wallet size={20} /></span><div><div className="eyebrow">Sway account</div><h2 id="wallet-title">Connect wallet</h2></div></div>
         <p className="wallet-subtitle">Connect to place calls and manage positions.</p>
-        <button className="wallet-option" onClick={connect} disabled={connecting}><span className="wallet-icon"><Wallet size={20} /></span><span><b>{connecting ? "Connecting..." : "Browser wallet"}</b><small>MetaMask, Rabby, Coinbase</small></span><strong>{connecting ? <Loader2 className="spin-icon" size={18} /> : "→"}</strong></button>
+        {(connectors.length ? connectors : [{ uid: "fallback", name: "Browser wallet" }]).filter((c, i, list) => list.findIndex((x) => x.uid === c.uid) === i).map((connector) => <button key={connector.uid} className="wallet-option" onClick={() => connect(connector)} disabled={connecting}><span className="wallet-icon"><Wallet size={20} /></span><span><b>{connector.name}</b><small>Connect securely</small></span><strong>{connecting ? <Loader2 className="spin-icon" size={18} /> : "→"}</strong></button>)}
         <div className="wallet-network"><span className="network-dot" /> Somnia Shannon <span>·</span> Testnet</div>
         {error && <div className="wallet-error" role="alert"><AlertCircle size={16} /><span>{error}</span></div>}
       </section>
@@ -595,7 +719,7 @@ function PositionsPanel({
   reconnecting: boolean;
   now: number;
   onConnect: () => void;
-  onCashOut: (rec: BetRecord, fraction?: number) => Promise<CashOutResult>;
+  onCashOut: (rec: BetRecord) => Promise<CashOutResult>;
   onRedeem: (rec: BetRecord, won: boolean) => Promise<RedeemResult>;
 }) {
   const [records, setRecords] = useState<BetRecord[]>([]);
@@ -761,10 +885,10 @@ function PositionsPanel({
             <span>Filled</span>
             <strong>{rec.filledQty ? `${rec.filledQty}` : "--"}</strong>
           </div>
-          <div>
+          {!rec.done && <div>
             <span>{settled ? "Result" : "Time left"}</span>
             <strong>{settled ? statusLabel : expiry != null ? (secs > 0 ? formatTime(secs) : "Locked") : "…"}</strong>
-          </div>
+          </div>}
           <div>
             <span>Potential payout</span>
             <strong>{rec.filledQty ? `${rec.filledQty.toFixed(2)} tUSDC` : "--"}</strong>
@@ -772,28 +896,25 @@ function PositionsPanel({
         </div>
         <div className="position-actions">
           {!settled && !rec.done && (
-            <div className="cashout-options" aria-label="Choose cash out amount">
-            {[0.25, 0.5, 1].map((fraction) => <button
-              key={fraction}
+            <button
               className="up-action"
-              disabled={isBusy || !quote?.canCashOut}
+              disabled={isBusy || secs <= 0 || !quote?.canCashOut}
               title={
                 quote?.canCashOut
                   ? "Sell your position back to the order book now"
                   : "No buyers on the book yet — cash out isn't available for this position right now."
               }
-              onClick={() => act(rec, () => onCashOut(rec, fraction), fraction === 1 ? "Cash out" : `Cash out ${fraction * 100}%`)}
+              onClick={() => act(rec, () => onCashOut(rec), "Cash out")}
             >
-              {isBusy ? "Confirming…" : fraction === 1 ? "Cash out all" : `Cash out ${fraction * 100}%`}
-            </button>)}
-            </div>
+              {isBusy ? "Confirming…" : quote?.canCashOut ? `Cash out ${(quote.estProceeds ?? 0).toFixed(2)} tUSDC` : "Cash out unavailable"}
+            </button>
           )}
           {won && !rec.done && (
             <button className="lime-btn" disabled={isBusy} onClick={() => act(rec, () => onRedeem(rec, true), "Redeem")}>
               {isBusy ? "Confirming…" : "Redeem winnings"}
             </button>
           )}
-          {rec.txHash && (
+          {rec.done && rec.txHash && (
             <a className="text-link" href={`https://shannon-explorer.somnia.network/tx/${rec.txHash}`} target="_blank" rel="noreferrer">
               View tx ↗
             </a>
